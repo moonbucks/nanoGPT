@@ -46,7 +46,8 @@ always_save_checkpoint = True  # if True, always save a checkpoint after each ev
 init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 train_iters = 200000
 # data
-dataset = "openwebtext"
+#dataset = "openwebtext"
+dataset = "shakespeare_char"
 gradient_accumulation_steps = 1  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -125,6 +126,7 @@ if master_process:
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+torch.backends.cuda.enable_mem_efficient_sdp(enabled=False)
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
 
 """ FSDP uses mixed precision policies...
@@ -195,6 +197,7 @@ model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 5
 #model_args['mesh'] = tp_device_mesh
 gptconf = GPTConfig(**model_args)
 model = GPT(tp_device_mesh, gptconf)
+#model = GPT(gptconf)
 
 model.to(device)
 
@@ -203,11 +206,23 @@ _mfu_model_params = model.get_num_params()
 _current_model_params = _mfu_model_params / 1e6
 
 def tp(model, n_layer, mesh):
+  for name, modules in model.named_modules():
+    print(name, type(modules))
+
   for i in range(n_layer):
     block = model.get_submodule(f'transformer.h.{i}')
-    parallelize_module(block, mesh, {'attn.c_attn': ColwiseParallel(),
-                                     'attn.c_proj': RowwiseParallel(),
-                                     'mlp': PairwiseParallel()})
+    parallelize_module(block, mesh, {'attn.q': ColwiseParallel(),
+                                     'attn.k': ColwiseParallel(),
+                                     'attn.v': ColwiseParallel(),
+                                     'attn.o': ColwiseParallel(),
+                                     #'mlp.c_fc': ColwiseParallel(),
+                                     #'mlp.c_proj': RowwiseParallel()})
+                                     'mlp': PairwiseParallel()}) # why not work?
+
+    if os.getenv('RANK') == '0' and i == 0:
+      print('layer', i)
+      print(block.mlp.c_fc.weight)
+      print(block.mlp.c_proj.weight)
   return model
 
 model = tp(model, n_layer, tp_device_mesh)
@@ -282,7 +297,7 @@ while local_iter_num < train_iters:
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = get_batch("train")
     loss.backward()
-    optimizer.step()
+    #optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     torch.distributed.barrier()
 
@@ -298,10 +313,10 @@ while local_iter_num < train_iters:
 
         mfu = model.estimate_mfu(
             _mfu_model_params,
-            cfg.batch_size,  # / _fsdp_size * world_size,  #  * gradient_accumulation_steps,
+            batch_size,  # / _fsdp_size * world_size,  #  * gradient_accumulation_steps,
             dt,
-            config_file=model_config,
-            tp_size=_tp_size,
+            #config_file=gptconf,
+            #tp_size=_tp_size,
         )
         running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         rank_print(
