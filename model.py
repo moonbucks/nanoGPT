@@ -47,7 +47,7 @@ class LayerNorm(nn.Module):
         self.mesh = mesh
 
     def forward(self, input):
-        return F.layer_norm(input.to_local(), self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class Attention(nn.Module):
   def __init__(self, mesh, config):
@@ -94,13 +94,15 @@ class Attention(nn.Module):
     tp_size = world_size 
     _rank = int(os.getenv('RANK'))
 
-    #print(f'Q weight at rank {_rank} of shape {self.q.weight.shape} and local shape {self.q.weight.to_local().shape}') # = {self.q.weight}')
+    print(f'Q weight at rank {_rank} of shape {self.q.weight.shape} and local shape {self.q.weight.to_local().shape} weight= {self.q.weight}')
     ###print(f'[Rank{_rank}] X (12, 1024, 768) x WQ (768, 768) = {self.q(x).shape}, local = {self.q(x).to_local().shape}')
-    ###print(f'[Rank{_rank}] Q(x) = {self.q(x)}')
+    print(f'L99 - [Rank{_rank}] Q(x) = {self.q(x)}')
+  
 
-    #print0(self.q(x).split(self.n_embd // tp_size, dim=2)) # tuple of duplicates 
+    print0(self.q(x).split(self.n_embd // tp_size, dim=2)) # tuple of duplicates 
                                                             # however we do not want duplicates at this point
 
+    quit()
     # shard in colwise: [Shard(2)] due to the batch in dim=0
     q = self.q(x).redistribute(self.mesh, [Shard(2)]).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # no need to divide by tp_size as we 'redistributed' the tensor 
     k = self.k(x).redistribute(self.mesh, [Shard(2)]).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # no need to divide by tp_size as we 'redistributed' the tensor 
@@ -176,21 +178,23 @@ class CausalSelfAttention(nn.Module):
           if os.getenv('RANK') == '0':
             print(msg)
 
-        print0(f'Sequence length: {T}')
+        #print0(f'Sequence length: {T}')
 
         tp_size = 2
 
         channel_head_size = C // self.n_head
 
         _rank = os.getenv('RANK')
-        print0(f'Using flash: {self.flash}')
-        print0(f'Q split shape: {self.q(x).shape}')
-        print(f'Q split result at rank {_rank}: {self.q(x)}')
+        #print0(f'Using flash: {self.flash}')
+        #print0(f'Q split shape: {self.q(x).shape}')
+        #print(f'Q split result at rank {_rank}: {self.q(x)}')
+
+        #print('L192', self.q(x).split(self.n_embd // tp_size, dim=2)) # size one tuple
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q = self.q(x).split(self.n_embd // tp_size, dim=2)[int(os.getenv('RANK'))].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        k = self.k(x).split(self.n_embd // tp_size, dim=2)[int(os.getenv('RANK'))].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.v(x).split(self.n_embd // tp_size, dim=2)[int(os.getenv('RANK'))].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.q(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.k(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = self.v(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -213,7 +217,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C // tp_size) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -239,8 +243,8 @@ class Block(nn.Module):
     def __init__(self, mesh, config):
         super().__init__()
         self.ln_1 = LayerNorm(mesh, config.n_embd, bias=config.bias)
-        #self.attn = CausalSelfAttention(config)
-        self.attn = Attention(mesh, config)
+        self.attn = CausalSelfAttention(config)
+        #self.attn = Attention(mesh, config)
         self.ln_2 = LayerNorm(mesh, config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.mesh = mesh
@@ -248,15 +252,14 @@ class Block(nn.Module):
     def forward(self, x):
         #print('X', x) # regular
         #print('Attn', self.attn(self.ln_1(x)))
-        x = distribute_tensor(x, device_mesh=self.mesh, placements=[Replicate()])
+        #x = distribute_tensor(x, device_mesh=self.mesh, placements=[Replicate()])
         x = x + self.attn(self.ln_1(x))
         #print('X', x) # regular
         #print('MLP', self.mlp(self.ln_2(x)))
-        ln_2 = distribute_tensor(self.ln_2(x), device_mesh=self.mesh, placements=[Replicate()])
-        mlp = distribute_tensor(self.mlp(ln_2), device_mesh=self.mesh, placements=[Replicate()])
-        x = x + mlp
-        #x = x + self.mlp(ln_2)
-        #x = x + self.mlp(self.ln_2(x))
+        #ln_2 = distribute_tensor(self.ln_2(x), device_mesh=self.mesh, placements=[Replicate()])
+        #mlp = distribute_tensor(self.mlp(ln_2), device_mesh=self.mesh, placements=[Replicate()])
+        #x = x + mlp
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass

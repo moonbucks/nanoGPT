@@ -206,23 +206,23 @@ _mfu_model_params = model.get_num_params()
 _current_model_params = _mfu_model_params / 1e6
 
 def tp(model, n_layer, mesh):
-  for name, modules in model.named_modules():
-    print(name, type(modules))
+  #for name, modules in model.named_modules():
+  #  print(name, type(modules))
 
   for i in range(n_layer):
     block = model.get_submodule(f'transformer.h.{i}')
     parallelize_module(block, mesh, {'attn.q': ColwiseParallel(),
                                      'attn.k': ColwiseParallel(),
                                      'attn.v': ColwiseParallel(),
-                                     'attn.o': ColwiseParallel(),
+                                     'attn.c_proj': RowwiseParallel(),
                                      #'mlp.c_fc': ColwiseParallel(),
                                      #'mlp.c_proj': RowwiseParallel()})
                                      'mlp': PairwiseParallel()}) # why not work?
 
-    if os.getenv('RANK') == '0' and i == 0:
-      print('layer', i)
-      print(block.mlp.c_fc.weight)
-      print(block.mlp.c_proj.weight)
+    #if os.getenv('RANK') == '0' and i == 0:
+    #  print('layer', i)
+    #  print(block.mlp.c_fc.weight)
+    #  print(block.mlp.c_proj.weight)
   return model
 
 model = tp(model, n_layer, tp_device_mesh)
@@ -236,7 +236,8 @@ use_fused = (device_type == "cuda") and (
 
 rank_print(f"Optimizer = using fused AdamW: {use_fused}")
 extra_args = dict(fused=True) if use_fused else dict()
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, **extra_args)
+#optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, **extra_args)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -297,7 +298,7 @@ while local_iter_num < train_iters:
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = get_batch("train")
     loss.backward()
-    #optimizer.step()
+    optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     torch.distributed.barrier()
 
