@@ -25,6 +25,8 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
+from pippy.IR import pipe_split
+
 def print0(msg):
   if int(os.getenv('RANK')) == 0:
     print(msg)
@@ -181,7 +183,8 @@ class CausalSelfAttention(nn.Module):
 
         #print0(f'Sequence length: {T}')
 
-        tp_size = 2
+        #tp_size = 2
+        tp_size = 1
 
         channel_head_size = C // self.n_head
 
@@ -198,7 +201,8 @@ class CausalSelfAttention(nn.Module):
         v = self.v(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        flash = self.flash
+        if flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
@@ -276,11 +280,13 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, mesh, config):
+    def __init__(self, mesh, config, world_size=8):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.mesh = mesh
+        self.world_size = world_size
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -326,18 +332,26 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+    def forward(self, idx, targets):
+        #device = idx.device
+        #b, t = idx.size()
+        
+        # WARNING: t needs to actual sequence length 
+        #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        rank = os.getenv('RANK')
+        pos = torch.arange(0, self.config.block_size, dtype=torch.long, device=f'cuda:{rank}').unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        cutpoint = len(self.transformer.h) // self.world_size 
+        cur = 0
         for block in self.transformer.h:
+            if cur > 0 and cur % cutpoint == 0:
+              pipe_split()
             x = block(x)
+            cur += 1
         x = self.transformer.ln_f(x)
 
         if targets is not None:
