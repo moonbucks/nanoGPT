@@ -174,7 +174,7 @@ if meta_vocab_size is None:
 model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
 #model_args['mesh'] = tp_device_mesh
 gptconf = GPTConfig(**model_args)
-model = GPT(tp_device_mesh, gptconf)
+model = GPT(tp_device_mesh, gptconf, world_size=world_size)
 #model = GPT(gptconf)
 
 model.to(device)

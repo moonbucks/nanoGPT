@@ -278,11 +278,13 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, mesh, config):
+    def __init__(self, mesh, config, world_size=8):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.mesh = mesh
+        self.world_size = world_size
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -329,19 +331,19 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets):
-        #if b == None and t == None and device == None:
         #device = idx.device
         #b, t = idx.size()
         
+        # WARNING: t needs to actual sequence length 
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         rank = os.getenv('RANK')
-        pos = torch.arange(0, 1024, dtype=torch.long, device=f'cuda:{rank}').unsqueeze(0) # shape (1, t)
+        pos = torch.arange(0, self.config.block_size, dtype=torch.long, device=f'cuda:{rank}').unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        cutpoint = len(self.transformer.h) // 4
+        cutpoint = len(self.transformer.h) // self.world_size 
         cur = 0
         for block in self.transformer.h:
             if cur > 0 and cur % cutpoint == 0:
