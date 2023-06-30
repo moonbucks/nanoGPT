@@ -27,10 +27,6 @@ from torch.distributed.tensor.parallel import (
 
 from pippy.IR import pipe_split
 
-def print0(msg):
-  if int(os.getenv('RANK')) == 0:
-    print(msg)
-
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -74,8 +70,7 @@ class CausalSelfAttention(nn.Module):
         # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
 
-        #self.tp_size = self.mesh.mesh.size(0)
-        self.tp_size = 1
+        self.tp_size = self.mesh.mesh.size(0)
 
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
@@ -107,15 +102,7 @@ class CausalSelfAttention(nn.Module):
             from torch.distributed._tensor import DeviceMesh, Shard, Replicate, distribute_tensor
             mesh = DeviceMesh('cuda', list(range(2)))
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            print0(self.bias.shape)
-            print0(self.bias)
-            #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            rowwise_placement=[Shard(0)]
-            colwise_placement=[Shard(1)]
-            replica_placement = [Replicate()]
-            d_bias = distribute_tensor(self.bias.view(self.block_size, self.block_size), device_mesh=mesh, placements=colwise_placement) 
-            print0(f'Attention shape: {att.shape}')
-            att = att.masked_fill(d_bias.view(1,1,self.block_size, self.block_size)[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -146,7 +133,6 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(mesh, config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(mesh, config)
-        #self.attn = Attention(mesh, config)
         self.ln_2 = LayerNorm(mesh, config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.mesh = mesh
@@ -221,7 +207,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets):
+    def forward(self, idx, targets=None):
         #device = idx.device
         #b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
