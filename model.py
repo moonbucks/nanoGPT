@@ -27,11 +27,6 @@ from torch.distributed.tensor.parallel import (
 
 from pippy.IR import pipe_split
 
-def print0(msg):
-  if int(os.getenv('RANK')) == 0:
-    print(msg)
-
-
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -52,105 +47,13 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class Attention(nn.Module):
-  def __init__(self, mesh, config):
-    super().__init__()
-    self.k = nn.Linear(config.n_embd, config.n_embd, bias=config.bias) 
-    self.q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias) 
-    self.v = nn.Linear(config.n_embd, config.n_embd, bias=config.bias) 
-    self.o = nn.Linear(config.n_embd, config.n_embd, bias=config.bias) 
-
-    self.n_head = config.n_head
-    self.n_embd = config.n_embd
-    self.dropout = config.dropout
-    self.block_size = config.block_size
-
-    self.mesh = mesh
-
-    self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size, config.block_size))
-
-    self.attn_dropout = nn.Dropout(config.dropout)
-    self.resid_dropout = nn.Dropout(config.dropout)
-
-  def forward(self, x, sharded=True):
-    world_size = torch.cuda.device_count()
-
-    B,T,C = x.size() # Batch, Sequence length, Embeding size
-
-    if not sharded:
-      q = self.q(x).split(self.n_embd, dim=2)[0].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-      k = self.k(x).split(self.n_embd, dim=2)[0].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-      v = self.v(x).split(self.n_embd, dim=2)[0].view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-      att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-      att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-      att = F.softmax(att, dim=-1)
-      att = self.attn_dropout(att)
-      y = att @ v
-      y = y.transpose(1,2).contiguous().view(B,T,C)
-      y = self.resid_dropout(self.o(y))
-      return y
-
-    ###print0(f'X size: {x.size()}')
-
-    channel_head_size = C // self.n_head
-    tp_size = world_size 
-    _rank = int(os.getenv('RANK'))
-
-    print(f'Q weight at rank {_rank} of shape {self.q.weight.shape} and local shape {self.q.weight.to_local().shape} weight= {self.q.weight}')
-    ###print(f'[Rank{_rank}] X (12, 1024, 768) x WQ (768, 768) = {self.q(x).shape}, local = {self.q(x).to_local().shape}')
-    print(f'L99 - [Rank{_rank}] Q(x) = {self.q(x)}')
-  
-
-    print0(self.q(x).split(self.n_embd // tp_size, dim=2)) # tuple of duplicates 
-                                                            # however we do not want duplicates at this point
-
-    quit()
-    # shard in colwise: [Shard(2)] due to the batch in dim=0
-    q = self.q(x).redistribute(self.mesh, [Shard(2)]).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # no need to divide by tp_size as we 'redistributed' the tensor 
-    k = self.k(x).redistribute(self.mesh, [Shard(2)]).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # no need to divide by tp_size as we 'redistributed' the tensor 
-    v = self.v(x).redistribute(self.mesh, [Shard(2)]).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # no need to divide by tp_size as we 'redistributed' the tensor 
-    ###print(f'[Rank{_rank}] redistributed q shape: {q.to_local().shape}')
-    #print(f'[Rank{_rank}] redistributed q value: {q}')
-
-    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-    ###print0(f'att size: {att.shape}, att local size: {att.to_local().shape}') # again, here they seem to all-reduce the result again.. 
-                                                                             # this is actually not I expected, but it makes easy to apply softmax 
-    ###print0(f'bias size: {self.bias.shape}')
-
-    """
-    dbias = distribute_tensor(self.bias.view(self.block_size, self.block_size), device_mesh = mesh, placements=colwise).view(1,1,self.block_size, self.block_size)
-    print0(f'Distributed Bias Shape: {dbias.shape}')
-    print0(f'Attention Shape: {att.shape}')
-    att = att.masked_fill(dbias[:,:,:T,:T] == 0, float('-inf'))
-    """
-    # TODO Need to apply softmax and dropout to 'Sharded tensor' not to 'Replicated tensor'
-    replicated_bias = distribute_tensor(self.bias, device_mesh=self.mesh, placements=[Replicate()]).view(1,1,self.block_size, self.block_size)
-    att = att.masked_fill(replicated_bias[:,:,:T,:T] == 0, float('-inf'))
-    att = F.softmax(att, dim=-1)
-    att = self.attn_dropout(att)
-
-    # at this moment, att is Replicate()
-    att = att.redistribute(self.mesh, [Shard(1)])  
-    ###print0(f'Attn shape {att.shape}, local shape {att.to_local().shape}, att: {att}') 
-    ###print0(f'v shape {v.shape}, v: {v}')
-    y = att @ v
-    y = y.transpose(1,2).contiguous().view(B,T,C)
-    y = y.redistribute(self.mesh, [Shard(2)])
-    ###print0(f'y shape {y.shape}, local shape: {y.to_local().shape}, y: {y}')
-    ###print0(f'o shape {self.o.weight.shape}, local shape: {self.o.weight.to_local().shape}, o: {self.o.weight}')
-
-    y = self.resid_dropout(self.o(y))
-    # How do they handle multiplication of Replicate() (y) and Rowwise() (o)?
-
-    return y
-
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, mesh, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.mesh = mesh
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -166,7 +69,9 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
-        #self.flash = False
+
+        self.tp_size = self.mesh.mesh.size(0)
+
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -181,28 +86,15 @@ class CausalSelfAttention(nn.Module):
           if os.getenv('RANK') == '0':
             print(msg)
 
-        #print0(f'Sequence length: {T}')
-
-        #tp_size = 2
-        tp_size = 1
-
         channel_head_size = C // self.n_head
 
-        _rank = os.getenv('RANK')
-        #print0(f'Using flash: {self.flash}')
-        #print0(f'Q split shape: {self.q(x).shape}')
-        #print(f'Q split result at rank {_rank}: {self.q(x)}')
-
-        #print('L192', self.q(x).split(self.n_embd // tp_size, dim=2)) # size one tuple
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q = self.q(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        k = self.k(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.v(x).split(self.n_embd // tp_size, dim=2)[0].view(B, T, self.n_head // tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.q(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.k(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = self.v(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        flash = self.flash
-        if flash:
+        if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
@@ -210,19 +102,11 @@ class CausalSelfAttention(nn.Module):
             from torch.distributed._tensor import DeviceMesh, Shard, Replicate, distribute_tensor
             mesh = DeviceMesh('cuda', list(range(2)))
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            print0(self.bias.shape)
-            print0(self.bias)
-            #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            rowwise_placement=[Shard(0)]
-            colwise_placement=[Shard(1)]
-            replica_placement = [Replicate()]
-            d_bias = distribute_tensor(self.bias.view(self.block_size, self.block_size), device_mesh=mesh, placements=colwise_placement) 
-            print0(f'Attention shape: {att.shape}')
-            att = att.masked_fill(d_bias.view(1,1,self.block_size, self.block_size)[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C // tp_size) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C // self.tp_size) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -249,22 +133,13 @@ class Block(nn.Module):
     def __init__(self, mesh, config):
         super().__init__()
         self.ln_1 = LayerNorm(mesh, config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        #self.attn = Attention(mesh, config)
+        self.attn = CausalSelfAttention(mesh, config)
         self.ln_2 = LayerNorm(mesh, config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.mesh = mesh
 
     def forward(self, x):
-        #print('X', x) # regular
-        #print('Attn', self.attn(self.ln_1(x)))
-        #x = distribute_tensor(x, device_mesh=self.mesh, placements=[Replicate()])
         x = x + self.attn(self.ln_1(x))
-        #print('X', x) # regular
-        #print('MLP', self.mlp(self.ln_2(x)))
-        #ln_2 = distribute_tensor(self.ln_2(x), device_mesh=self.mesh, placements=[Replicate()])
-        #mlp = distribute_tensor(self.mlp(ln_2), device_mesh=self.mesh, placements=[Replicate()])
-        #x = x + mlp
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -280,13 +155,14 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, mesh, config, world_size=8):
+    def __init__(self, mesh, config, device, pp_size=2):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
         self.mesh = mesh
-        self.world_size = world_size
+        self.pp_size = pp_size
+        self.device = device
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -332,20 +208,19 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets):
+    def forward(self, idx, targets=None):
         #device = idx.device
         #b, t = idx.size()
-        
-        # WARNING: t needs to actual sequence length 
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        rank = os.getenv('RANK')
-        pos = torch.arange(0, self.config.block_size, dtype=torch.long, device=f'cuda:{rank}').unsqueeze(0) # shape (1, t)
+
+        # WARNING: t needs to actual sequence length, shape should be (1,t) 
+        pos = torch.arange(0, self.config.block_size, dtype=torch.long, device=self.device).unsqueeze(0) 
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        cutpoint = len(self.transformer.h) // self.world_size 
+        cutpoint = len(self.transformer.h) // self.pp_size
         cur = 0
         for block in self.transformer.h:
             if cur > 0 and cur % cutpoint == 0:
