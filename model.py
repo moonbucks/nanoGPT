@@ -6,6 +6,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
+import os
 
 import math
 import inspect
@@ -14,6 +15,17 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+import torch.distributed as dist
+from torch.distributed._tensor import DeviceMesh, Shard, Replicate, distribute_tensor
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    PairwiseParallel,
+    RowwiseParallel,
+    parallelize_module,
+)
+
+from pippy.IR import pipe_split
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -26,21 +38,27 @@ def new_gelu(x):
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
+    def __init__(self, mesh, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
+        self.weight = nn.Parameter(torch.ones(ndim)) 
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.mesh = mesh
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, mesh, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.mesh = mesh
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.v = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -49,22 +67,31 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
+
+        self.tp_size = self.mesh.mesh.size(0)
+
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.block_size = config.block_size 
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        def print0(msg):
+          if os.getenv('RANK') == '0':
+            print(msg)
+
+        channel_head_size = C // self.n_head
+
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = self.q(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.k(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = self.v(x).split(self.n_embd // self.tp_size, dim=2)[0].view(B, T, self.n_head // self.tp_size, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -72,12 +99,14 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
             # manual implementation of attention
+            from torch.distributed._tensor import DeviceMesh, Shard, Replicate, distribute_tensor
+            mesh = DeviceMesh('cuda', list(range(2)))
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C // self.tp_size) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -88,24 +117,26 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = new_gelu(x)
+        x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, mesh, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(mesh, config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(mesh, config)
+        self.ln_2 = LayerNorm(mesh, config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.mesh = mesh
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -124,18 +155,21 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, mesh, config, device, pp_size=2):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.mesh = mesh
+        self.pp_size = pp_size
+        self.device = device
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([Block(mesh, config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(mesh, config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -175,17 +209,24 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        #device = idx.device
+        #b, t = idx.size()
+        #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # WARNING: t needs to actual sequence length, shape should be (1,t) 
+        pos = torch.arange(0, self.config.block_size, dtype=torch.long, device=self.device).unsqueeze(0) 
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        cutpoint = len(self.transformer.h) // self.pp_size
+        cur = 0
         for block in self.transformer.h:
+            if cur > 0 and cur % cutpoint == 0:
+              pipe_split()
             x = block(x)
+            cur += 1
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -318,26 +359,33 @@ class GPT(nn.Module):
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = False # YEONJU
         print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, num_params, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
+        #N = self.get_num_params()
+        N = num_params
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        tp_size = 2
+        actual_head = cfg.n_head // tp_size
+        #L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        L, H, Q, T = cfg.n_layer, actual_head, cfg.n_embd//actual_head, cfg.block_size
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
+        #flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        #mfu = flops_achieved / flops_promised
+        flops_promised = 125e12  # A10 TFlops ....  312e12  A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = (flops_achieved / flops_promised) / tp_size
         return mfu
 
     @torch.no_grad()

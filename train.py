@@ -44,9 +44,9 @@ wandb_log = False  # disabled by default
 wandb_project = "owt"
 wandb_run_name = "gpt2"  # 'run' + str(time.time())
 # data
-dataset = "openwebtext"
-gradient_accumulation_steps = 5  # used to simulate larger batch sizes
-batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
+dataset = 'openwebtext'
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -74,6 +74,7 @@ device = (
 )
 dtype = "bfloat16"  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -94,11 +95,26 @@ if ddp:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank  # each process gets a different seed
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank # each process gets a different seed
+    # world_size number of processes will be training simultaneously, so we can scale
+    # down the desired gradient accumulation iterations per process proportionally
+    assert gradient_accumulation_steps % ddp_world_size == 0
+    gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     gradient_accumulation_steps *= 8  # simulate 8 gpus
+    ddp_world_size = 1
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+print(f"tokens per iteration will be: {tokens_per_iter:,}")
+>>>>>>> deaaf13b19400e59d072e6f9a43cbf8bfdd36ff2
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -228,6 +244,7 @@ optimizer = model.configure_optimizers(
 )
 if init_from == "resume":
     optimizer.load_state_dict(checkpoint["optimizer"])
+checkpoint = None # free up memory
 
 # compile the model
 dynamo = False
@@ -407,6 +424,7 @@ while True:
             )
         with ctx:
             logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch("train")
         # backward pass, with gradient scaling if training in fp16
@@ -426,8 +444,8 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        lossf = loss.item()  # loss as float. note: this is a CPU-GPU sync point
-        if local_iter_num >= 5:  # let the training loop settle a bit
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(
