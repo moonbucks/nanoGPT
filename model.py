@@ -220,11 +220,7 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        cutpoint = len(self.transformer.h) // self.pp_size
-        cur = 0
         for block in self.transformer.h:
-            if cur > 0 and cur % cutpoint == 0:
-              pipe_split()
             x = block(x)
             cur += 1
         x = self.transformer.ln_f(x)
