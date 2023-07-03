@@ -64,6 +64,7 @@ def get_args():
   parser.add_argument('--gradient_accumulation_steps', type=int, default=1) # used to simulate larger batch sizes
   parser.add_argument('--batch_size', type=int, default=12)  # if gradient_accumulation_steps > 1, this is the micro-batch size
   parser.add_argument('--block_size', type=int, default=1024)
+  parser.add_argument('--vocab_size', type=int, default=50304)
 
   # model
   parser.add_argument('--n_layer', type=int, default=12)
@@ -106,6 +107,11 @@ def rank_print(x):
     _rank = os.getenv('RANK')
     if _rank == 0:
         print(x)
+
+def get_rand(args):
+    x = torch.randint(0, args.vocab_size, (args.batch_size, args.block_size), device=args.device)
+    y = torch.randint(0, args.vocab_size, (args.batch_size, args.block_size), device=args.device)
+    return x, y
 
 def get_batch(data, args):
     ix = torch.randint(len(data) - args.block_size, (args.batch_size,))
@@ -225,7 +231,8 @@ def pp_and_tp_fg(model, mesh, args, train_data, tp_attn_layers=None, tp_mlp_laye
     att = tp_attention(model, f'{name}.attn', mesh, tp_dim)
     mlp = tp_mlp(model, f'{name}', mesh, tp_dim)
 
-  X, Y = get_batch(train_data, args)
+  #X, Y = get_batch(train_data, args)
+  X, Y = get_rand(args)
 
   if args.local_rank == 0:
     for name, module in model.named_modules():
