@@ -129,6 +129,22 @@ def get_batch(data, args):
     return x, y
 
 
+def tp_attention(model, name, mesh, tp_dim=0, q='q', k='k', v='v', o='c_proj'):
+  layer = model.get_submodule(name)
+  parallelize_module(layer, mesh, { q: ColwiseParallel(),
+                                    k: ColwiseParallel(),
+                                    v: ColwiseParallel(),
+                                    o: RowwiseParallel() },
+                                    tp_mesh_dim=tp_dim)
+
+  return model
+
+def tp_mlp(model, name, mesh, tp_dim=0, mlp='mlp'):
+  layer = model.get_submodule(name)
+  parallelize_module(layer, mesh, { mlp: PairwiseParallel() }, tp_mesh_dim=tp_dim)
+
+  return model
+
 
 def tp(model, n_layer, mesh, offset=0, tp_dim=0):
   for i in range(n_layer):
@@ -141,8 +157,6 @@ def tp(model, n_layer, mesh, offset=0, tp_dim=0):
                                      tp_mesh_dim=tp_dim) 
 
   return model
-
-
 
 def pp(model, pp_device_mesh, args):
   from pippy.IR import annotate_split_points, PipeSplitWrapper 
@@ -182,6 +196,50 @@ def pp_and_tp(model, mesh, args, train_data):
             example_inputs=[X, Y],
             )
   
+  return model, stage
+
+def even_cut(model, args, pp_size, cut={}):
+  from pippy.IR import annotate_split_points, PipeSplitWrapper 
+  cutpoint = args.n_layer // pp_size
+  for i in range(args.n_layer):
+    name = f'transformer.h.{i}'
+    if i > 0 and i % cutpoint == 0:
+      cut[name] = PipeSplitWrapper.SplitPoint.BEGINNING # or END
+
+  annotate_split_points(model, cut)
+
+def pp_and_tp_fg(model, mesh, args, train_data, tp_attn_layers=None, tp_mlp_layers=None, cut_fn=even_cut):
+  from pippy.compile import compile_stage
+  from pippy.microbatch import TensorChunkSpec, sum_reducer
+
+  pp_dim, tp_dim = 0, 1
+  pp_rank, tp_rank = args.local_rank // args.tp_size, args.local_rank % args.tp_size
+  pp_groups = mesh.get_dim_groups()[pp_dim]
+
+  # TP
+  # Apply TP to layers if layer_id is in tp_attn / tp_mlp 
+  tp_attn_layers = list(range(args.n_layer)) if tp_attn_layers is None else tp_attn_layers
+  tp_mlp_layers = list(range(args.n_layer)) if tp_mlp_layers is None else tp_mlp_layers
+  for i in range(args.n_layer):
+    name = f'transformer.h.{i}'
+    att = tp_attention(model, f'{name}.attn', mesh, tp_dim)
+    mlp = tp_mlp(model, f'{name}', mesh, tp_dim)
+
+  X, Y = get_batch(train_data, args)
+
+  if args.local_rank == 0:
+    for name, module in model.named_modules():
+      print(name)
+
+  # PP
+  cut_fn(model, args, args.pp_size)
+  stage = compile_stage(model, pp_rank, args.world_size, args.pp_size, args.device, pp_groups, 
+            example_inputs=[X, Y],
+            )
+
+  if args.local_rank == 0:
+    print(stage.submod)
+
   return model, stage
 
 # learning rate decay scheduler (cosine with warmup)
@@ -373,7 +431,9 @@ if __name__ == '__main__':
 
   #model = tp(model, args.n_layer, oned_mesh)
   #model, stage = pp(model, oned_mesh, args)
-  model, stage = pp_and_tp(model, twod_mesh, args, train_data)
+  #model, stage = pp_and_tp(model, twod_mesh, args, train_data)
+  model, stage = pp_and_tp_fg(model, twod_mesh, args, train_data)
+
 
   # optimizer
   # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
