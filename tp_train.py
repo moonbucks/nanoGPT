@@ -144,14 +144,14 @@ def rank_print(x):
 
 _gpu_mem_tracker = Memory_Maximizer(rank=_rank)
 
-rank_print(f"2D (TP + FSDP) is available = {_2D_Ready}\n")
+print(f"2D (TP + FSDP) is available = {_2D_Ready} {_rank} {world_size}\n")
 
 if _2D_Ready and cfg.use_tensor_parallel:
     # 2-D mesh is [dp, tp].
     # tp = tensor parallel group size (num gpus per TP sharding).
     # dp = FSDP data group size (groups to shard the model across).
 
-    tensor_parallel_size = 2
+    tensor_parallel_size = 8
 
     twod_mesh = DeviceMesh(
         device_type="cuda",
@@ -221,6 +221,10 @@ best_val_loss = 1e9
 rank_print("Initializing a new model from scratch")
 
 _2D = cfg.use_tensor_parallel
+enable_profiler = cfg.run_profiler
+if enable_profiler:
+    print(f"Profiling active.  Traces will be saved at {cfg.profile_folder}")
+
 tp_device_mesh = None
 
 if _2D:
@@ -254,7 +258,7 @@ else:
 # todo - add back main code later for resume training
 mixed_precision_policy = fsdp_config.set_mixed_precision_policy()
 
-
+print("fsdp_pg ", fsdp_pg)
 model = FSDP(
     model,
     auto_wrap_policy=cfg.wrapping_policy,
@@ -263,12 +267,15 @@ model = FSDP(
     process_group=fsdp_pg,
     limit_all_gathers=cfg.use_rate_limiter,
 )
-
-
 if cfg.use_fsdp_activation_checkpointing:
     fsdp_config.apply_checkpointing_policy(model)
     if _rank == 0:
         print(f"--> FSDP activation checkpointing in use")
+
+print("Model: ", model)
+print("DTensor spec: ", model.transformer.h[0].attn.c_attn.weight._spec, model.transformer.h[0].attn.c_proj.weight._spec, model.transformer.h[0].mlp.c_fc.weight._spec, model.transformer.h[0].mlp.c_proj.weight._spec)
+
+
 # optimizer
 # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
 
@@ -374,18 +381,18 @@ def maybe_run_profiler(cfg, *args, **kwargs):
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=1, warmup=2, active=3, repeat=1),
+            schedule=torch.profiler.schedule(wait=1, warmup=2, active=1, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
                 cfg.profile_folder
             ),
-            profile_memory=True,
+            profile_memory=False,
             with_stack=True,
-            record_shapes=True,
+            record_shapes=False,
         ) as torch_profiler:
             yield torch_profiler
     else:
         torch_profiler = contextlib.nullcontext()
-        yield None
+        yield torch_profiler
 
 if cfg.run_profiler:
     print(f"Profiling active.  Traces will be saved at {cfg.profile_folder}")
@@ -393,15 +400,15 @@ if cfg.run_profiler:
 with maybe_run_profiler(cfg) as torch_profiler:
     while local_iter_num < cfg.iters_to_run:
         if cfg.use_flop_counter and local_iter_num == _iter_get_flops:
-            flop_counter = FlopCounterMode(rank=_rank)
-            with flop_counter:
-                t0 = time.perf_counter()
-                logits, loss = model(X, Y)
-                X, Y = get_batch("train")
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            _tflops = get_total_flops(flop_counter) / 1e12
+            # flop_counter = FlopCounterMode(rank=_rank)
+            # with flop_counter:
+            t0 = time.perf_counter()
+            logits, loss = model(X, Y)
+            X, Y = get_batch("train")
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            # _tflops = get_total_flops(flop_counter) / 1e12
         else:
             t0 = time.perf_counter()
             logits, loss = model(X, Y)

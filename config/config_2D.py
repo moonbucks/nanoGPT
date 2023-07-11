@@ -23,16 +23,16 @@ import torch.distributed as dist
 class train_config(base_config):
     # current models = "10.5M", "124M", "201M", "1B", "1.5B"
     model_name: str = "1.5B"
-    use_tensor_parallel: bool = False
+    use_tensor_parallel: bool = True
 
     dataset = "openwebtext"  # options = shakespeare_char, openwebtext
     data_dir = "data"
     run_profiler = True
-    profile_folder = "fsdp/traces/"
+    profile_folder = "tp_2d/traces/"
 
     iters_to_run: int = 8
 
-    batch_size = 1
+    batch_size = 8
 
     block_size = 1024  # 256  # 1024 = gpt2, openwebtext, context of up to 256 previous characters
     use_bias: bool = False  # use bias in linear layers (recommend No)
@@ -96,7 +96,7 @@ def build_model(cfg, tp_mesh=None, rank=None):
 
     elif model_name == "1.5B":
         n_layer: int = 46
-        n_head: int = 20
+        n_head: int = 32
         n_embd: int = 1600
 
     else:

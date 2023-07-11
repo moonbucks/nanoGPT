@@ -75,8 +75,8 @@ class base_config:
     sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
     print_sharding_plan: bool = False
 
-    run_profiler: bool = False
-    profile_folder: str = "fsdp/profile_tracing"
+    # run_profiler: bool = False
+    # profile_folder: str = "fsdp/profile_tracing"
 
     # disable forward_prefetch since it currently doesn't work with activation
     # checkpointing for several cases
