@@ -1,7 +1,7 @@
 # tp
 for b in 10 #{1..16}
 do
-    torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=mew1 --master_port=1234 train.py --batch_size=$b --gradient_accumulation_steps=1 --max_iters=10 2>&1 | tee test.log #results/${b}.log
+    torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=mew1 --master_port=1234 train.py --batch_size=$b --gradient_accumulation_steps=1 --dataset=random 2>&1 | tee test.log #results/${b}.log
 done
 
 #for b in {1..16}
