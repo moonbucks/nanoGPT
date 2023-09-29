@@ -28,6 +28,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.profiler import profile, record_function, ProfilerActivity
 
+import torch.distributed as dist
+from torch.distributed._tensor import DeviceMesh
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    PairwiseParallel,
+    RowwiseParallel,
+    parallelize_module,
+)
+
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -61,7 +70,7 @@ max_iters = 100 #600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.0 #1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -82,15 +91,31 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
+distributed = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+ddp = False
+tp = True
+
+assert not (ddp and tp), "Only single parallel is supported"
+
+if distributed:
     init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    global_rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    master_process = global_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    master_process = True
+
+if master_process:
+    print(f"I'm the master process {global_rank}")
+    
+
+if ddp:
+    ddp_rank = global_rank
+    ddp_local_rank = local_rank 
+    ddp_world_size = world_size 
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
@@ -98,9 +123,14 @@ if ddp:
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
-    master_process = True
     seed_offset = 0
     ddp_world_size = 1
+
+if tp:
+    tp_size = 4
+else:
+    tp_size = 1
+
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
@@ -165,7 +195,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, tp_size=tp_size) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -211,6 +241,21 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+# tp
+if tp:
+    twod_mesh = DeviceMesh(
+        device_type='cuda',
+        mesh=torch.arange(0, world_size).view(-1, tp_size)
+    ) 
+    mesh = DeviceMesh('cuda', list(range(world_size)))
+
+    for i in range(n_layer):
+        block = model.get_submodule(f'transformer.h.{i}')
+        parallelize_module(block, mesh, {'attn.c_attn': ColwiseParallel(),
+                                         'attn.c_proj': RowwiseParallel(),
+                                         'mlp': PairwiseParallel()})
+
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -279,10 +324,12 @@ running_mfu = -1.0
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
     schedule=torch.profiler.schedule(
-        skip_first=10, wait=0, warmup=20, active=10, repeat=1
+        #skip_first=10, wait=0, warmup=20, active=10, repeat=1
+        skip_first=5, wait=0, warmup=2, active=1, repeat=1
     ), 
 ) as prof:
     while True:
+        print(f'arrived {global_rank} at iteration {iter_num}')
 
         torch.cuda.reset_peak_memory_stats()
         # determine and set the learning rate for this iteration
@@ -328,9 +375,9 @@ with profile(
                 # I really dislike that this bloats the code and forces us to repeat code
                 # looking at the source of that context manager, it just toggles this variable
                 model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-            with ctx:
-                logits, loss = model(X, Y)
-                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            #with ctx:
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             #X, Y = get_batch('train')
             #X, Y = get_rand_batch()
@@ -352,15 +399,16 @@ with profile(
         t1 = time.time()
         dt = t1 - t0
         #t0 = t1
-        if iter_num % log_interval == 0 and master_process:
+        #if iter_num % log_interval == 0 and master_process:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * gradient_accumulation_steps
-            mfu = 0.0
-            if local_iter_num >= 5: # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f} ms, mfu {mfu*100:.2f}% running mfu {running_mfu*100:.2f}%, peak memory: {torch.cuda.max_memory_allocated(device=device)/1024/1024/1024:.4f}GB")
+            #lossf = loss.item() * gradient_accumulation_steps
+            #mfu = 0.0
+            #if local_iter_num >= 5: # let the training loop settle a bit
+            #    mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            #    running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            #print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f} ms, mfu {mfu*100:.2f}% running mfu {running_mfu*100:.2f}%, peak memory: {torch.cuda.max_memory_allocated(device=device)/1024/1024/1024:.4f}GB")
+        dist.barrier()
         iter_num += 1
         local_iter_num += 1
 
@@ -368,7 +416,7 @@ with profile(
         if iter_num > max_iters:
             break
 
-    prof.export_chrome_trace(f"traces/batch_{batch_size}/rank{ddp_rank}.json")
+    prof.export_chrome_trace(f"traces/batch_{batch_size}/rank{global_rank}.json")
 
 if ddp:
     destroy_process_group()
