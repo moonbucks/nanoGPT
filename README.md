@@ -1,3 +1,7 @@
+# verifying mfu
+
+to check whether the gpu reaches the peak performance, i added simple mlp model (forward only)
+internal testing purpose
 
 # nanoGPT
 
