@@ -180,7 +180,7 @@ class CausalSelfAttention(nn.Module):
 
         #print0(f'Sequence length: {T}')
 
-        tp_size = 2
+        tp_size = torch.cuda.device_count()
 
         channel_head_size = C // self.n_head
 
