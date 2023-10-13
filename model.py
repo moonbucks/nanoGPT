@@ -125,18 +125,20 @@ class CausalSelfAttention(nn.Module):
             B,
             T,
             C,
-        ) = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        ) = (
+            x.size()
+        )  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # pre-calc channel head size
-        channel_head_size = C // self.n_head
+        def print0(msg):
+            if os.getenv("RANK") == "0":
+                print(msg)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x).split(self.n_embd // self.tp_size, dim=2)
-        for item in qkv:
-            item = item.view(B, T, self.tp_num_heads, channel_head_size).transpose(
-                1, 2
-            )  # ==>  (B, nh, T, hs)
-        q, k, v = qkv
+        query_projected = self.c_attn(x)
+
+        q, k, v = query_projected.chunk(3, -1)
+        q = q.view(B, T, -1, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, -1, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, -1, C // self.n_head).transpose(1, 2)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -151,9 +153,9 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        # re-assemble all head outputs side by side, accounting for tp sharding
-        y = y.transpose(1, 2).contiguous().view(B, T, C // self.tp_size)
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, -1)
+        )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -466,8 +468,9 @@ class GPT(nn.Module):
         # express our flops throughput as ratio of A100 bfloat16 peak flops or A10 bf16 flops
         flops_achieved = flops_per_iter * (1.0 / dt)  # per second
 
-        flops_promised = 125e12  # A10 TFlops ....  312e12  A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_promised = 156e12  # A10 TFlops ....  312e12  A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = (flops_achieved / flops_promised) / tp_size
+        print(f"num_params: {num_params}, batchsize: {fwdbwd_per_iter}, dt: {dt}")
 
         return mfu
 

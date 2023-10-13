@@ -30,7 +30,7 @@ class train_config(base_config):
     run_profiler = True
     profile_folder = "tp_2d/traces/"
 
-    iters_to_run: int = 8
+    iters_to_run: int = 50
 
     batch_size = 8
 
@@ -44,7 +44,7 @@ class train_config(base_config):
 
     # FSDP specific
     use_rate_limiter: bool = True
-    use_mixed_precision: bool = True
+    use_mixed_precision: bool = False 
     wrapping_policy = ModuleWrapPolicy({CausalSelfAttention, MLP})
     model_sharding_strategy = ShardingStrategy.FULL_SHARD
     use_fsdp_activation_checkpointing: bool = True

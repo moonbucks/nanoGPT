@@ -151,7 +151,7 @@ if _2D_Ready and cfg.use_tensor_parallel:
     # tp = tensor parallel group size (num gpus per TP sharding).
     # dp = FSDP data group size (groups to shard the model across).
 
-    tensor_parallel_size = 8
+    tensor_parallel_size = 1
 
     twod_mesh = DeviceMesh(
         device_type="cuda",
@@ -187,7 +187,7 @@ _batch_size = cfg.batch_size
 rank_print(f"batch_size = {cfg.batch_size=}")
 
 
-def get_batch(split):
+def get_batch_org(split):
     data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (_batch_size,))
     x = torch.stack(
@@ -206,6 +206,24 @@ def get_batch(split):
         )
     else:
         x, y = x.to(device), y.to(device)
+    return x, y
+
+
+def get_batch(split):
+    x = torch.randint(
+        0,  
+        50304,
+        (_batch_size, 1024),
+        device=device,
+        dtype=torch.int64,
+    )   
+    y = torch.randint(
+        0,  
+        50304,
+        (_batch_size, 1024),
+        device=device,
+        dtype=torch.int64,
+    )   
     return x, y
 
 
@@ -234,10 +252,6 @@ if _2D:
 
 model, model_config = fsdp_config.build_model(cfg, tp_device_mesh, rank=_rank)
 
-# we need this or else calcing mfu in fsdp = sharded model size...
-_mfu_model_params = model.get_num_params()
-_current_model_params = _mfu_model_params / 1e6
-
 
 if _2D:
     # need to init all model layers with TP
@@ -246,6 +260,8 @@ if _2D:
     num_layers = parallelize_model(model, model_config, twod_mesh)
 
     rank_print(f"initialized model for 2D with {num_layers} layers.\n")
+
+    #model.to('cpu')
 
 if _2D:
     fsdp_pg = twod_mesh.get_dim_groups()[0]
@@ -272,6 +288,13 @@ if cfg.use_fsdp_activation_checkpointing:
     if _rank == 0:
         print(f"--> FSDP activation checkpointing in use")
 
+# we need this or else calcing mfu in fsdp = sharded model size...
+_mfu_model_params = model.get_num_params()
+print(f"MFU model params: {_mfu_model_params}")
+_current_model_params = _mfu_model_params / 1e6
+
+
+
 print("Model: ", model)
 print("DTensor spec: ", model.transformer.h[0].attn.c_attn.weight._spec, model.transformer.h[0].attn.c_proj.weight._spec, model.transformer.h[0].mlp.c_fc.weight._spec, model.transformer.h[0].mlp.c_proj.weight._spec)
 
@@ -282,6 +305,8 @@ print("DTensor spec: ", model.transformer.h[0].attn.c_attn.weight._spec, model.t
 use_fused = (device_type == "cuda") and (
     "fused" in inspect.signature(torch.optim.AdamW).parameters
 )
+
+use_fused = False
 
 rank_print(f"Optimizer = using fused AdamW: {use_fused}")
 extra_args = dict(fused=True) if use_fused else dict()
